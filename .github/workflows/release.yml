@@ -1,0 +1,87 @@
+name: Windows 다운로드 배포
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: story-forge-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 첫 업로드의 소스 펼치기
+        if: ${{ hashFiles('package.json') == '' }}
+        shell: pwsh
+        run: |
+          $temp = Join-Path $env:RUNNER_TEMP 'story-forge-source'
+          Expand-Archive -Path storyforge-source.zip -DestinationPath $temp -Force
+          Get-ChildItem -LiteralPath (Join-Path $temp 'StoryForge') -Force | Where-Object { $_.Name -ne '.github' } | Copy-Item -Destination . -Recurse -Force
+          Remove-Item storyforge-source.zip
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit -m 'Import complete Story Forge editor source'
+          if ($LASTEXITCODE -ne 0) { throw 'Source commit failed' }
+          git push origin HEAD:main
+          if ($LASTEXITCODE -ne 0) { throw 'Source upload failed' }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: 의존성 설치
+        run: npm ci
+      - name: 버전과 저장소 확인
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $p = Get-Content package.json | ConvertFrom-Json
+          $tag = "v$($p.version)"
+          "RELEASE_SHA=$(git rev-parse HEAD)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne $tag) { throw 'Tag and package version do not match' }
+          $visibility = gh repo view $env:GITHUB_REPOSITORY --json visibility --jq .visibility
+          if ($visibility -ne 'PUBLIC') { throw 'Public releases are required for token-free desktop updates. Do not put a token in the app.' }
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $latest = gh release view --repo $env:GITHUB_REPOSITORY --json tagName --jq .tagName 2>$null
+          if ($LASTEXITCODE -eq 0 -and $latest -match '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            if ([version]$p.version -le [version]$latest.Substring(1)) { throw 'Version must be newer than the published release' }
+          }
+          node scripts/configure-release.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Release configuration failed' }
+      - name: 기능 및 업데이트 검증
+        run: npm test
+      - name: Windows 설치 파일 생성
+        run: npm run dist
+      - name: 다운로드 및 무결성 정보 생성
+        run: node scripts/release-assets.cjs
+      - name: 설치 및 제거 확인
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path release/StoryForge-Setup.exe).Path
+          $target = Join-Path $env:RUNNER_TEMP 'StoryForge-install-check'
+          $p = Start-Process -FilePath $installer -ArgumentList "/S /D=$target" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or !(Test-Path "$target\Story Forge.exe")) { throw 'Installation failed' }
+          $u = Start-Process -FilePath "$target\Uninstall.exe" -ArgumentList "/S _?=$target" -Wait -PassThru
+          if ($u.ExitCode -ne 0 -or (Test-Path "$target\Story Forge.exe")) { throw 'Uninstallation failed' }
+      - name: 모든 파일을 올린 뒤 공개
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = $env:RELEASE_TAG
+          $draft = gh release view $tag --repo $repo --json isDraft --jq .isDraft 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $repo --target $env:RELEASE_SHA --draft --title "이야기 공방 $tag" --notes-file RELEASE_NOTES.txt
+            if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
+          } elseif ($draft -ne 'true') { throw 'This version is already published. Increase package.json version.' }
+          gh release upload $tag release/StoryForge-Setup.exe release/latest.json release/SHA256SUMS.txt --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Asset upload failed; draft remains unpublished' }
+          gh release edit $tag --repo $repo --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

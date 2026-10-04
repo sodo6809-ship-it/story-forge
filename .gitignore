@@ -1,0 +1,11 @@
+node_modules/
+release/
+*.log
+*-preview.png
+tests/import.png
+sample-game.html
+StoryForge-Windows-*.zip
+.env
+.env.*
+*.pem
+*.key

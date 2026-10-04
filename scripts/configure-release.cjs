@@ -1,0 +1,1 @@
+const fs=require('node:fs');const {repository}=require('../app/updater.cjs');const repo=repository(process.env.GITHUB_REPOSITORY||process.argv[2]);fs.writeFileSync('app/update-config.json',JSON.stringify({repository:repo},null,2)+'\n');console.log('Update destination: '+repo);
